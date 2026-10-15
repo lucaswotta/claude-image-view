@@ -2,7 +2,7 @@ import { atom, read, update } from 'claude-code'
 import type { EngineInterface, Register } from 'claude-code'
 
 import type { PastedImage } from '../types'
-import { blockCells, drawsPictures, fitRow, imageNumbers, pngSize } from './layout'
+import { BLOCK_TILE, PICTURE_TILE, blockCells, drawsPictures, fitRow, imageNumbers, pngSize } from './layout'
 import type { Size } from './layout'
 import { decodeThumb } from './png'
 import type { Thumb } from './png'
@@ -159,7 +159,8 @@ export const register: Register = on => {
     if (list.length === 0) return next(e)
 
     const { Box, Image, Raster, Text } = $.ui.resolve(e)
-    const cells = fitRow(list.map(image => image.size), e.props.maxRows, e.props.bodyColumns)
+    const tile = (await canDrawPictures($)) ? PICTURE_TILE : BLOCK_TILE
+    const cells = fitRow(list.map(image => image.size), e.props.maxRows, e.props.bodyColumns, tile)
     if (cells.length === 0) return next(e)
     const hidden = list.length - cells.length
     const below = await next(e)

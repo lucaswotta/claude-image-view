@@ -5,7 +5,7 @@
 export type Thumb = { width: number; height: number; rgb: Uint8Array }
 
 // The longest side of the stored thumbnail, in pixels: more than any tile can show.
-const THUMB_SIDE = 96
+const THUMB_SIDE = 128
 // What transparent pixels are composited over (the dark of most terminal themes).
 const BACKDROP = 0x1e
 // Refuse a picture whose raw scanlines would be bigger than this (an Adam7-free 8k x 8k RGBA).

@@ -1,6 +1,6 @@
 import { expect, mock, test } from 'claude-code/testing'
 
-import { blockCells, drawsPictures, fitCells, fitRow, imageNumbers, pngSize } from '../hooks/layout'
+import { BLOCK_TILE, blockCells, drawsPictures, fitCells, fitRow, imageNumbers, pngSize } from '../hooks/layout'
 import { decodeThumb } from '../hooks/png'
 
 function pngHead(width: number, height: number): string {
@@ -275,21 +275,41 @@ test('a PNG that cannot be decoded gives no thumbnail', () => {
   expect(decodeThumb(corrupt)).toBeNull()
 })
 
-test('a thumbnail is averaged down into half-block cells', () => {
-  // 64x40 drawn in 8x2 cells is 8x4 pixels: each is the average of an 8x10 block of the picture.
-  const thumb = decodeThumb(bytesOf(RGBA))!
-  const words = new Uint32Array(bytesOf(blockCells(thumb, 8, 2)).buffer)
-  expect(words.length).toBe(8 * 2 * 3)
-  expect(words[0]).toBe(0x2580) // an upper half block
-  const mean = (y0: number, f: (x: number, y: number) => number) => {
-    let sum = 0
-    for (let y = y0; y < y0 + 10; y++) for (let x = 0; x < 8; x++) sum += f(x, y)
-    return Math.round(sum / 80)
-  }
-  const color = (y0: number) =>
-    (mean(y0, x => x * 4) << 16) | (mean(y0, (_, y) => y * 6) << 8) | mean(y0, (x, y) => (x * y) % 256)
-  expect(words[1]).toBe(color(0)) // the cell's foreground is the top pixel...
-  expect(words[2]).toBe(color(10)) // ...and its background the one below
+test('block tiles grow past picture tiles, and still shrink to fit the band', () => {
+  const wide = { width: 1600, height: 900 }
+  expect(fitRow([wide], 20, 120)).toEqual([{ columns: 21, rows: 6 }])
+  expect(fitRow([wide], 20, 120, BLOCK_TILE)).toEqual([{ columns: 43, rows: 12 }])
+  // A band 10 rows tall leaves 7 for the picture.
+  expect(fitRow([wide], 10, 120, BLOCK_TILE)).toEqual([{ columns: 25, rows: 7 }])
+  // A panorama is held to the wider block limit.
+  expect(fitCells({ width: 6000, height: 500 }, BLOCK_TILE.rows, BLOCK_TILE.columns)).toEqual({ columns: 64, rows: 3 })
+})
+
+// A thumbnail from rows of colors, one letter a pixel.
+const COLORS: Record<string, number> = { k: 0x000000, w: 0xffffff, r: 0xff0000, b: 0x0000ff }
+const thumbOf = (...lines: string[]) => ({
+  width: lines[0]!.length,
+  height: lines.length,
+  rgb: Uint8Array.from(lines.join('').split('').flatMap(c => [COLORS[c]! >> 16, (COLORS[c]! >> 8) & 0xff, COLORS[c]! & 0xff])),
+})
+const cellsOf = (thumb: ReturnType<typeof thumbOf>, columns: number, rows: number) => {
+  const words = new Uint32Array(bytesOf(blockCells(thumb, columns, rows)).buffer)
+  return Array.from({ length: words.length / 3 }, (_, i) => [...words.subarray(i * 3, i * 3 + 3)])
+}
+
+test('each cell holds four pixels, drawn with the quadrant glyph that splits them best', () => {
+  // Four cells of 2x2 pixels: flat red, red beside blue, white in the top left, white in the bottom right.
+  const cells = cellsOf(thumbOf('rrrbwkkk', 'rrrbkkkw'), 4, 1)
+  expect(cells[0]).toEqual([0x2580, 0xff0000, 0xff0000]) // flat: one color
+  expect(cells[1]).toEqual([0x258c, 0xff0000, 0x0000ff]) // ▌ left half red, right blue
+  expect(cells[2]).toEqual([0x2598, 0xffffff, 0x000000]) // ▘ top left white
+  expect(cells[3]).toEqual([0x259b, 0x000000, 0xffffff]) // ▛ all black but the bottom right
+})
+
+test('a thumbnail is averaged down into the cells\' pixels', () => {
+  // 8x4 in one row of two cells is 4x2 pixels, each the average of a 2x2 checker: flat gray.
+  const cells = cellsOf(thumbOf('wkwkwkwk', 'kwkwkwkw', 'wkwkwkwk', 'kwkwkwkw'), 2, 1)
+  expect(cells).toEqual(Array(2).fill([0x2580, 0x808080, 0x808080]))
 })
 
 test('real pictures only where Claude Code draws them: kitty and Ghostty, or when forced', () => {
@@ -311,9 +331,11 @@ test('real pictures only where Claude Code draws them: kitty and Ghostty, or whe
   expect(drawsPictures({ TERM: 'xterm-kitty', CLAUDE_IMAGE_VIEW_RENDERER: 'blocks' })).toBe(false)
 })
 
-for (const [name, env, drawn, notDrawn] of [
-  ['a terminal without pictures gets the thumbnail in colored blocks', { TERM_PROGRAM: 'Apple_Terminal' }, 'Raster', 'Image'],
-  ['a kitty terminal still gets the real picture', { TERM: 'xterm-kitty' }, 'Image', 'Raster'],
+for (const [name, env, drawn, notDrawn, size] of [
+  // 64x40 is wider than tall: twice as many columns as rows * 64 / 40, in a block tile 12 rows tall...
+  ['a terminal without pictures gets the thumbnail in colored blocks', { TERM_PROGRAM: 'Apple_Terminal' }, 'Raster', 'Image', { columns: 38, rows: 12 }],
+  // ...or a picture tile 6 rows tall.
+  ['a kitty terminal still gets the real picture', { TERM: 'xterm-kitty' }, 'Image', 'Raster', { columns: 19, rows: 6 }],
 ] as const) {
   test(name, async ($, on) => {
     const clock = mock.clock(on)
@@ -336,8 +358,7 @@ for (const [name, env, drawn, notDrawn] of [
 
     const ui = await $.ui.mount({ ...BAND, surface: 'terminal' })
     expect(await ui.find({ type: notDrawn })).toBeUndefined()
-    // 64x40 is wider than tall: 6 rows of cells, twice as many columns as 6 * 64 / 40 pixels.
-    expect((await ui.find({ type: drawn }))?.props).toMatchObject({ columns: 19, rows: 6 })
+    expect((await ui.find({ type: drawn }))?.props).toMatchObject(size)
     await ui.unmount()
   })
 }

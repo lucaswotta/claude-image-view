@@ -1,8 +1,11 @@
 export type Size = { width: number; height: number }
 export type Cells = { columns: number; rows: number }
 
-const TILE_ROWS = 6
-const MAX_COLUMNS = 32
+export type Tile = { rows: number; columns: number }
+// The largest picture box. A real picture is sharp at any size, so its tiles stay small.
+export const PICTURE_TILE: Tile = { rows: 6, columns: 32 }
+// Colored blocks hold only 2x2 pixels a cell, so their tiles may grow: size is detail.
+export const BLOCK_TILE: Tile = { rows: 12, columns: 64 }
 const MIN_COLUMNS = 4
 // A terminal cell is about twice as tall as it is wide.
 const CELL_ASPECT = 2
@@ -32,32 +35,37 @@ export function pngSize(base64: string): Size | null {
   return width > 0 && height > 0 ? { width, height } : null
 }
 
-/** A picture box `rows` tall that keeps the picture's aspect ratio. */
-export function fitCells(size: Size | null, tileRows = TILE_ROWS): Cells {
+/** A picture box `rows` tall, at most `maxColumns` wide, that keeps the picture's aspect ratio. */
+export function fitCells(size: Size | null, tileRows = PICTURE_TILE.rows, maxColumns = PICTURE_TILE.columns): Cells {
   const { width, height } = size ?? FALLBACK
   let rows = tileRows
   let columns = Math.round((rows * CELL_ASPECT * width) / height)
-  if (columns > MAX_COLUMNS) {
-    columns = MAX_COLUMNS
-    rows = Math.max(1, Math.round((MAX_COLUMNS * height) / (CELL_ASPECT * width)))
+  if (columns > maxColumns) {
+    columns = maxColumns
+    rows = Math.max(1, Math.round((maxColumns * height) / (CELL_ASPECT * width)))
   }
   return { columns: Math.max(MIN_COLUMNS, columns), rows: Math.min(rows, tileRows) }
 }
 
 /**
  * Picture boxes for one row of tiles that fits the band whole, so it never scrolls:
- * the tallest tiles whose chrome fits in `maxRows` and whose total width fits in `bodyColumns`.
+ * the tallest tiles, up to `tile`, whose chrome fits in `maxRows` and whose total width fits in `bodyColumns`.
  * When even one-row tiles are too wide, only the first ones that fit beside a `+N` label for
  * the rest; none when the band is too small for one tile.
  */
-export function fitRow(sizes: readonly (Size | null)[], maxRows: number, bodyColumns: number): Cells[] {
+export function fitRow(
+  sizes: readonly (Size | null)[],
+  maxRows: number,
+  bodyColumns: number,
+  tile: Tile = PICTURE_TILE,
+): Cells[] {
   if (maxRows < TILE_CHROME_ROWS + 1) return []
-  const tallest = Math.min(TILE_ROWS, maxRows - TILE_CHROME_ROWS)
+  const tallest = Math.min(tile.rows, maxRows - TILE_CHROME_ROWS)
   for (let tileRows = tallest; tileRows > 1; tileRows--) {
-    const cells = sizes.map(size => fitCells(size, tileRows))
+    const cells = sizes.map(size => fitCells(size, tileRows, tile.columns))
     if (rowWidth(cells, 0) <= bodyColumns) return cells
   }
-  const cells = sizes.map(size => fitCells(size, 1))
+  const cells = sizes.map(size => fitCells(size, 1, tile.columns))
   let count = cells.length
   while (count > 0 && rowWidth(cells.slice(0, count), cells.length - count) > bodyColumns) count--
   return cells.slice(0, count)
@@ -90,17 +98,26 @@ export function drawsPictures(env: Env): boolean {
   )
 }
 
+// Quadrant glyphs by which of a cell's pixels take the foreground, as bits: top left 1,
+// top right 2, bottom left 4. The bottom right pixel always takes the background (any split
+// is one of these or its mirror, with the colors swapped).
+const QUADRANTS = [0x2580, 0x2598, 0x259d, 0x2580, 0x2596, 0x258c, 0x259e, 0x259b]
+
+type Rgb = [number, number, number]
+
 /**
  * The cells of a `Raster` that draws `rgb` (a `width` x `height` thumbnail) in `columns` x `rows`
- * cells, base64. Each cell is an upper half block, so it holds two pixels: the top as its
- * foreground and the bottom as its background.
+ * cells, base64. Each cell holds four pixels, two across and two down, in two colors: of the
+ * quadrant glyphs (one, two or three pixels in the foreground) it takes the split whose two
+ * average colors stray least from the four pixels. A flat cell is an upper half block in one color.
  */
 export function blockCells(thumb: { width: number; height: number; rgb: Uint8Array }, columns: number, rows: number): string {
+  const pixelColumns = columns * 2
   const pixelRows = rows * 2
-  const average = (px: number, py: number): number => {
+  const average = (px: number, py: number): Rgb => {
     // The box of source pixels under output pixel (px, py), at least one pixel wide and tall.
-    const x0 = Math.floor((px * thumb.width) / columns)
-    const x1 = Math.max(x0 + 1, Math.floor(((px + 1) * thumb.width) / columns))
+    const x0 = Math.floor((px * thumb.width) / pixelColumns)
+    const x1 = Math.max(x0 + 1, Math.floor(((px + 1) * thumb.width) / pixelColumns))
     const y0 = Math.floor((py * thumb.height) / pixelRows)
     const y1 = Math.max(y0 + 1, Math.floor(((py + 1) * thumb.height) / pixelRows))
     let r = 0
@@ -116,15 +133,37 @@ export function blockCells(thumb: { width: number; height: number; rgb: Uint8Arr
       }
     }
     n = n || 1
-    return (Math.round(r / n) << 16) | (Math.round(g / n) << 8) | Math.round(b / n)
+    return [r / n, g / n, b / n]
   }
+  const pack = ([r, g, b]: Rgb) => (Math.round(r) << 16) | (Math.round(g) << 8) | Math.round(b)
+  // The average of the pixels in `mask` (or outside it) and how far they stray from it.
+  const split = (pixels: Rgb[], mask: number, inside: boolean): { color: Rgb; error: number } => {
+    const members = pixels.filter((_, i) => ((mask >> i) & 1) === (inside ? 1 : 0))
+    const color: Rgb = [0, 1, 2].map(c => members.reduce((sum, p) => sum + p[c]!, 0) / members.length) as Rgb
+    const error = members.reduce((sum, p) => sum + (p[0] - color[0]) ** 2 + (p[1] - color[1]) ** 2 + (p[2] - color[2]) ** 2, 0)
+    return { color, error }
+  }
+
   const words = new Uint32Array(columns * rows * 3)
   for (let row = 0; row < rows; row++) {
     for (let column = 0; column < columns; column++) {
+      const pixels = [
+        average(column * 2, row * 2),
+        average(column * 2 + 1, row * 2),
+        average(column * 2, row * 2 + 1),
+        average(column * 2 + 1, row * 2 + 1),
+      ]
+      const flat = split(pixels, 0, false)
+      let best = { mask: 0, fg: flat.color, bg: flat.color, error: flat.error }
+      for (let mask = 1; mask < QUADRANTS.length; mask++) {
+        const fg = split(pixels, mask, true)
+        const bg = split(pixels, mask, false)
+        if (fg.error + bg.error < best.error) best = { mask, fg: fg.color, bg: bg.color, error: fg.error + bg.error }
+      }
       const at = (row * columns + column) * 3
-      words[at] = 0x2580
-      words[at + 1] = average(column, row * 2)
-      words[at + 2] = average(column, row * 2 + 1)
+      words[at] = QUADRANTS[best.mask]!
+      words[at + 1] = pack(best.fg)
+      words[at + 2] = pack(best.bg)
     }
   }
   return (new Uint8Array(words.buffer) as Uint8Array & { toBase64(): string }).toBase64()
